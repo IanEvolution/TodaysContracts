@@ -1,4 +1,4 @@
-# One Check v2
+# Todays Contracts 
 
 A tiny Windows app: one task per day, punch it when it's done, set tomorrow's before you stop.
 
