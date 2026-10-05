@@ -75,6 +75,13 @@ namespace OneCheck
         public string Text = "";
     }
 
+    // a big idea parked in the vault until it gets queued as tomorrow's task
+    class Idea
+    {
+        public string Added = "";   // yyyy-MM-dd
+        public string Text = "";
+    }
+
     class Accent
     {
         public string Name; public Color Color;
@@ -327,18 +334,20 @@ namespace OneCheck
         readonly List<Routine> routines = new List<Routine>();
         readonly Dictionary<string, List<string>> routineLog = new Dictionary<string, List<string>>(); // id -> dates done
         const int MaxRoutines = 8, MaxRoutineLog = 20;
-        string dataDir, daysFile, stepsFile, settingsFile, routinesFile, routineLogFile;
+        const int MaxVault = 3;
+        readonly Idea[] vault = new Idea[MaxVault];   // fixed slots; null = empty
+        string dataDir, daysFile, stepsFile, settingsFile, routinesFile, routineLogFile, vaultFile;
         string todayKey;
 
         // ---------- ui state ----------
         bool editing, showSettings, showRoutines;   // showRoutines is a sub-screen of settings
         string hover = "";
         readonly Dictionary<string, Rectangle> hits = new Dictionary<string, Rectangle>();
-        TextBox txtToday, txtTomorrow, txtStep, txtRoutine;
-        Rectangle fieldToday, fieldTomorrow, fieldStep, fieldRoutine;
+        TextBox txtToday, txtTomorrow, txtStep, txtRoutine, txtVault;
+        Rectangle fieldToday, fieldTomorrow, fieldStep, fieldRoutine, fieldVault;
         float punchAnim = 1f, bootAnim = 1f;
         DateTime punchStart, bootStart;
-        System.Windows.Forms.Timer animTimer, tickTimer, flashTimer;
+        System.Windows.Forms.Timer animTimer, tickTimer, flashTimer, confirmTimer;
         string flash = "";
         int frame;
         int stepScroll;             // index of the first visible step row
@@ -349,6 +358,14 @@ namespace OneCheck
         int stepAnimIndex = -1;     // step being stamped, -1 = none
         DateTime stepAnimStart, unlockStart;   // unlockStart can be in the future: it waits for the step stamp
         bool unlockOn;
+        // vault animations, one per slot: kind + start time; progress is worked out from the clock while painting
+        const int VNone = 0, VStore = 1, VMove = 2, VDelete = 3;
+        const float VStoreMs = 250f, VMoveMs = 350f, VDeleteMs = 200f, NextPulseMs = 300f;
+        readonly int[] vAnimKind = new int[MaxVault];
+        readonly DateTime[] vAnimStart = new DateTime[MaxVault];
+        readonly Idea[] vGhost = new Idea[MaxVault];   // the idea that just left the slot (move / delete)
+        bool nextPulseOn; DateTime nextPulseStart;     // NEXT field border pulse when an idea lands there
+        int vConfirm = -1;                             // slot whose delete is waiting for a second click
 
         public MainForm()
         {
@@ -370,6 +387,7 @@ namespace OneCheck
             settingsFile = Path.Combine(dataDir, "settings.txt");
             routinesFile = Path.Combine(dataDir, "routines.txt");
             routineLogFile = Path.Combine(dataDir, "routine_log.txt");
+            vaultFile = Path.Combine(dataDir, "vault.txt");
 
             MakeFonts();
             LoadSettings();
@@ -379,6 +397,7 @@ namespace OneCheck
             LoadDays();
             LoadSteps();
             LoadRoutines();
+            LoadVault();
             todayKey = Key(DateTime.Today);
             Sfx.Init();
 
@@ -409,8 +428,16 @@ namespace OneCheck
             Controls.Add(txtToday);
             Controls.Add(txtTomorrow);
             Controls.Add(txtStep);
+            txtVault = MakeBox();
+            txtVault.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; AddVault(); }
+                else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; txtVault.Text = ""; ActiveControl = null; Invalidate(); }
+            };
+            txtTomorrow.TextChanged += (s, e) => Invalidate();   // the vault's NEXT buttons lock while this has text
             Controls.Add(txtRoutine);
-            foreach (var tb in new[] { txtToday, txtTomorrow, txtStep, txtRoutine })
+            Controls.Add(txtVault);
+            foreach (var tb in new[] { txtToday, txtTomorrow, txtStep, txtRoutine, txtVault })
             {
                 tb.GotFocus += (s, e) => Invalidate();
                 tb.LostFocus += (s, e) => Invalidate();
@@ -419,8 +446,9 @@ namespace OneCheck
             txtTomorrow.HandleCreated += (s, e) => Cue(txtTomorrow, "Queue it before you stop today");
             txtStep.HandleCreated += (s, e) => Cue(txtStep, "+ Add a step, press Enter");
             txtRoutine.HandleCreated += (s, e) => Cue(txtRoutine, "+ New routine, press Enter");
+            txtVault.HandleCreated += (s, e) => Cue(txtVault, "Store an idea in the vault");
 
-            // animation timer only runs during the boot wipe, the punch glitch, a step stamp and the punch unlock
+            // animation timer only runs during the boot wipe, the punch glitch, a step stamp, the punch unlock and vault animations
             animTimer = new System.Windows.Forms.Timer { Interval = 16 };
             animTimer.Tick += (s, e) =>
             {
@@ -432,7 +460,8 @@ namespace OneCheck
                 if (UnlockAnim >= 1f) unlockOn = false;
                 bool busy = bootAnim < 1f || punchAnim < 1f;
                 if (was && !busy) Relayout();
-                if (!busy && stepAnimIndex < 0 && !unlockOn) animTimer.Stop();
+                bool vaultBusy = VaultAnimTick();
+                if (!busy && stepAnimIndex < 0 && !unlockOn && !vaultBusy) animTimer.Stop();
                 Invalidate();
             };
             // checks once a minute whether the date rolled over; nothing else runs while idle
@@ -441,6 +470,9 @@ namespace OneCheck
             tickTimer.Start();
             flashTimer = new System.Windows.Forms.Timer { Interval = 1600 };
             flashTimer.Tick += (s, e) => { flashTimer.Stop(); flashTimer.Interval = 1600; flash = ""; Invalidate(); };
+            // one-shot: a vault delete that isn't confirmed in time goes back to "x"
+            confirmTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+            confirmTimer.Tick += (s, e) => { confirmTimer.Stop(); vConfirm = -1; Invalidate(); };
 
             Activated += (s, e) => CheckRollover();
             Shown += (s, e) =>
@@ -472,6 +504,8 @@ namespace OneCheck
         {
             return Color.FromArgb((int)(a.R + (b.R - a.R) * t), (int)(a.G + (b.G - a.G) * t), (int)(a.B + (b.B - a.B) * t));
         }
+
+        static Color Fade(Color c, int a) { return Color.FromArgb(Math.Max(0, Math.Min(255, a)), c); }
 
         static Color OnColor(Color c)
         {
@@ -695,6 +729,36 @@ namespace OneCheck
                     foreach (var d in l) sb.Append(r.Id).Append('\t').Append(d).Append("\r\n");
                 }
                 WriteAtomic(routineLogFile, sb.ToString());
+            }
+            catch (Exception ex) { flash = "SAVE FAILED: " + ex.Message; flashTimer.Start(); }
+        }
+
+        void LoadVault()
+        {
+            Array.Clear(vault, 0, MaxVault);
+            try
+            {
+                if (!File.Exists(vaultFile)) return;
+                int n = 0;
+                foreach (var line in File.ReadAllLines(vaultFile, Encoding.UTF8))
+                {
+                    var p = line.Split(new[] { '\t' }, 2);
+                    if (p.Length < 2 || p[0].Length != 10 || p[1].Trim() == "") continue;
+                    if (n >= MaxVault) break;
+                    vault[n++] = new Idea { Added = p[0], Text = p[1] };
+                }
+            }
+            catch { }
+        }
+
+        void SaveVault()
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                foreach (var v in vault)
+                    if (v != null) sb.Append(v.Added).Append('\t').Append(OneLine(v.Text)).Append("\r\n");
+                WriteAtomic(vaultFile, sb.ToString());
             }
             catch (Exception ex) { flash = "SAVE FAILED: " + ex.Message; flashTimer.Start(); }
         }
@@ -1068,6 +1132,122 @@ namespace OneCheck
             Relayout();
         }
 
+        // ---------- vault ----------
+        // Up to MaxVault big ideas. They can only leave by being queued as tomorrow's task or deleted;
+        // they never touch today's task, the steps, the routines or the streak.
+        int VaultCount() { int n = 0; foreach (var v in vault) if (v != null) n++; return n; }
+
+        // tomorrow is taken if a task is queued, or one is typed in the NEXT box but not queued yet
+        bool NextTaken
+        {
+            get { return Get(Key(DateTime.Today.AddDays(1))).Task != "" || txtTomorrow.Text.Trim() != ""; }
+        }
+
+        static int VaultAge(Idea v)
+        {
+            DateTime a;
+            if (!DateTime.TryParseExact(v.Added, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out a)) return 0;
+            return Math.Max(0, (DateTime.Today - a).Days);
+        }
+
+        // starting an animation on a slot replaces whatever was running there
+        void StartVaultAnim(int i, int kind, Idea ghost)
+        {
+            vAnimKind[i] = kind; vAnimStart[i] = DateTime.Now; vGhost[i] = ghost;
+            animTimer.Start();
+        }
+
+        // running animation on a slot (VNone if idle or finished) and its progress 0..1
+        int VaultAnim(int i, out float p)
+        {
+            p = 1f;
+            int kind = vAnimKind[i];
+            if (kind == VNone) return VNone;
+            float dur = kind == VStore ? VStoreMs : kind == VMove ? VMoveMs : VDeleteMs;
+            p = Math.Max(0f, Math.Min(1f, (float)(DateTime.Now - vAnimStart[i]).TotalMilliseconds / dur));
+            return p < 1f ? kind : VNone;
+        }
+
+        float NextPulse
+        {
+            get { return !nextPulseOn ? 1f : Math.Min(1f, (float)(DateTime.Now - nextPulseStart).TotalMilliseconds / NextPulseMs); }
+        }
+
+        // drops finished vault animations; true while any is still running
+        bool VaultAnimTick()
+        {
+            bool any = false;
+            for (int i = 0; i < MaxVault; i++)
+            {
+                float p;
+                if (vAnimKind[i] == VNone) continue;
+                if (VaultAnim(i, out p) == VNone) { vAnimKind[i] = VNone; vGhost[i] = null; }
+                else any = true;
+            }
+            if (NextPulse >= 1f) nextPulseOn = false; else any = true;
+            return any;
+        }
+
+        void ClearVaultConfirm() { vConfirm = -1; confirmTimer.Stop(); }
+
+        void AddVault()
+        {
+            string v = txtVault.Text.Trim();
+            if (v == "") return;
+            int i = Array.IndexOf(vault, null);
+            if (i < 0) return;
+            vault[i] = new Idea { Added = Key(DateTime.Today), Text = v };
+            SaveVault();
+            txtVault.Text = "";
+            ClearVaultConfirm();
+            Sound(Sfx.Save);
+            StartVaultAnim(i, VStore, null);
+            Relayout();
+            if (txtVault.Visible) txtVault.Focus(); else ActiveControl = null;
+        }
+
+        // the only way out of the vault besides deleting: become tomorrow's task, and only if tomorrow is free
+        void MoveVault(int i)
+        {
+            if (i < 0 || i >= MaxVault || vault[i] == null) return;
+            if (NextTaken) { Sound(Sfx.Undo); return; }
+            var idea = vault[i];
+            string k = Key(DateTime.Today.AddDays(1));
+            var d = Get(k); d.Task = idea.Text; days[k] = d;
+            SaveDays();
+            txtTomorrow.Text = idea.Text;
+            vault[i] = null;
+            SaveVault();
+            ClearVaultConfirm();
+            flash = "QUEUED";
+            flashTimer.Stop(); flashTimer.Start();
+            Sound(Sfx.Save);
+            nextPulseOn = true; nextPulseStart = DateTime.Now;
+            StartVaultAnim(i, VMove, idea);
+            Relayout();
+        }
+
+        // first click arms the row ("SURE?") for a few seconds, the second one deletes
+        void DeleteVault(int i)
+        {
+            if (i < 0 || i >= MaxVault || vault[i] == null) return;
+            if (vConfirm != i)
+            {
+                vConfirm = i;
+                confirmTimer.Stop(); confirmTimer.Start();
+                Sound(Sfx.Click);
+                Invalidate();
+                return;
+            }
+            var idea = vault[i];
+            vault[i] = null;
+            SaveVault();
+            ClearVaultConfirm();
+            Sound(Sfx.Undo);
+            StartVaultAnim(i, VDelete, idea);
+            Relayout();
+        }
+
         void Punch()
         {
             var d = Get(todayKey);
@@ -1162,7 +1342,12 @@ namespace OneCheck
         int RtY { get { return TY + TodayH + 12; } }
         int RtH { get { int n = DueRoutines().Count; return n == 0 ? 0 : 30 + RtRowH * n + 8; } }
         int NextY { get { int h = RtH; return RtY + (h > 0 ? h + 12 : 0); } }
-        int LogY { get { return NextY + 114; } }
+        // vault panel: fixed height, always MaxVault slot rows plus the add row
+        const int VRowsTop = 30, VRowH = 26;
+        const int VAddY = VRowsTop + VRowH * MaxVault + 6;
+        const int VaultH = VAddY + 30 + 12;
+        int VaultY { get { return NextY + 114; } }
+        int LogY { get { return VaultY + VaultH + 12; } }
         int MainH { get { return LogY + 224; } }
 
         // config + routines screens
@@ -1177,6 +1362,7 @@ namespace OneCheck
         Rectangle PanToday { get { return R(Pad, TY, LW - 2 * Pad, TodayH); } }
         Rectangle PanRoutine { get { return R(Pad, RtY, LW - 2 * Pad, RtH); } }
         Rectangle PanNext { get { return R(Pad, NextY, LW - 2 * Pad, 102); } }
+        Rectangle PanVault { get { return R(Pad, VaultY, LW - 2 * Pad, VaultH); } }
         Rectangle PanLog { get { return R(Pad, LogY, LW - 2 * Pad, 198); } }
 
         void Relayout()
@@ -1189,6 +1375,7 @@ namespace OneCheck
             fieldTomorrow = R(Pad + 16, NextY + 42, LW - 2 * Pad - 32 - 88, 42);
             fieldStep = R(Pad + 14, TY + AddY, LW - 2 * Pad - 28, 32);
             fieldRoutine = R(Pad + 14, RFieldY, LW - 2 * Pad - 28 - 80 - 6, 36);
+            fieldVault = R(Pad + 14, VaultY + VAddY, LW - 2 * Pad - 28 - 64 - 6, 30);
             // config screens never shrink the window below the main screen, so switching doesn't jump
             int need = showSettings ? Math.Max(MainH, showRoutines ? RoutinesH : SettingsH) : MainH;
             int h = D(Math.Max(need, LH));
@@ -1197,6 +1384,7 @@ namespace OneCheck
             PlaceBox(txtTomorrow, fieldTomorrow, !showSettings && !booting);
             PlaceBox(txtStep, fieldStep, !showSettings && !booting && AddVisible);
             PlaceBox(txtRoutine, fieldRoutine, showSettings && showRoutines && !booting && routines.Count < MaxRoutines);
+            PlaceBox(txtVault, fieldVault, !showSettings && !booting && VaultCount() < MaxVault);
             if (todayBox && !txtToday.Focused) txtToday.Text = t.Task;
             if (!txtTomorrow.Focused) txtTomorrow.Text = Get(Key(DateTime.Today.AddDays(1))).Task;
             if (todayBox && editing) { txtToday.Focus(); txtToday.SelectAll(); }
@@ -1357,7 +1545,7 @@ namespace OneCheck
         void PaintBootWipe(Graphics g)
         {
             // each band reveals left-to-right, staggered top to bottom, with an accent scanline at the edge
-            int[] bands = { 38, 136, NextY - 2, LogY - 2, LogY + 204, Math.Max(MainH, LH) };
+            int[] bands = { 38, 136, NextY - 2, VaultY - 2, LogY - 2, LogY + 204, Math.Max(MainH, LH) };
             for (int i = 0; i < bands.Length - 1; i++)
             {
                 float p = Math.Max(0f, Math.Min(1f, (bootAnim - i * 0.1f) / 0.5f));
@@ -1525,14 +1713,20 @@ namespace OneCheck
                 Micro(g, flash, fr.X + D(4), fr.Y + D(2), OnColor(accent), true);
             }
             PaintField(g, fieldTomorrow, txtTomorrow.Focused);
+            float np = NextPulse;
+            if (np < 1f)   // a vault idea just landed here: the border flashes accent and eases back
+                LineR(g, fieldTomorrow, Fade(accent, (int)(255 * (1 - np) * (1 - np))), 2f * S);
             var sv = R(LW - Pad - 16 - 80, NextY + 42, 80, 42);
             Hit("saveTomorrow", sv);
             bool hasTomorrow = Get(Key(DateTime.Today.AddDays(1))).Task != "";
             PaintOutlineBtn(g, sv, hasTomorrow ? "UPDATE" : "QUEUE", Hov("saveTomorrow"));
 
+            // ---- vault ----
+            PaintVault(g);
+
             // ---- log grid ----
             c = PanLog;
-            Panel(g, c, "[03]", "LOG  //  28 CYCLES");
+            Panel(g, c, "[04]", "LOG  //  28 CYCLES");
             DateTime today = DateTime.Today;
             DateTime end = today.AddDays(6 - (int)today.DayOfWeek);
             DateTime start = end.AddDays(-27);
@@ -1717,6 +1911,127 @@ namespace OneCheck
             }
 
             if (AddVisible) PaintField(g, fieldStep, txtStep.Focused);
+        }
+
+        void PaintVault(Graphics g)
+        {
+            var c = PanVault;
+            Panel(g, c, "[03]", "VAULT");
+            int n = VaultCount();
+            string cnt = n + "/" + MaxVault;
+            Micro(g, cnt, c.Right - D(14) - MicroW(g, cnt, true), c.Y + D(12), AccentText, true);
+
+            bool taken = NextTaken;
+            var clip = g.Save();
+            g.SetClip(c, CombineMode.Intersect);   // nothing in here draws outside the panel
+            for (int i = 0; i < MaxVault; i++)
+            {
+                var sr = R(Pad + 14, VaultY + VRowsTop + VRowH * i + 2, LW - 2 * Pad - 28, VRowH - 4);
+                float p;
+                int kind = VaultAnim(i, out p);
+                Idea idea = vault[i], ghost = vGhost[i];
+
+                if (idea != null)
+                {
+                    FillR(g, sr, cField);
+                    LineR(g, sr, cLine, 1f);
+                    if (kind == VStore)
+                    {   // store: a scanline sweeps left to right and the row appears behind it; the age fades in last
+                        float sp = Math.Min(1f, p / 0.8f);
+                        sp = 1 - (1 - sp) * (1 - sp);
+                        int sx = sr.X + (int)(sr.Width * sp);
+                        var st = g.Save();
+                        g.SetClip(new Rectangle(sr.X, sr.Y, sx - sr.X, sr.Height), CombineMode.Intersect);
+                        PaintVaultRow(g, i, sr, idea, 255, (int)(255 * Math.Max(0f, (p - 0.7f) / 0.3f)), true, true, taken);
+                        g.Restore(st);
+                        if (sp < 1f) FillR(g, new Rectangle(Math.Max(sr.X, sx - D(2)), sr.Y, D(2), sr.Height), accent);
+                    }
+                    else PaintVaultRow(g, i, sr, idea, 255, 255, true, true, taken);
+                }
+                else if (kind == VMove && ghost != null)
+                {   // upload: an accent tint sweeps right to left while the text fades, then the slot settles to empty
+                    float sp = Math.Min(1f, p / 0.7f);
+                    sp = 1 - (1 - sp) * (1 - sp);
+                    float settle = p < 0.7f ? 0f : (p - 0.7f) / 0.3f;
+                    int sx = sr.Right - (int)(sr.Width * sp);
+                    if (settle > 0f) PaintVaultEmpty(g, sr, (int)(255 * settle));
+                    int a = (int)(255 * (1 - settle));
+                    FillR(g, sr, Fade(cField, a));
+                    LineR(g, sr, Fade(cLine, a), 1f);
+                    int ta = (int)(255 * (1 - Math.Min(1f, p / 0.6f)));
+                    PaintVaultRow(g, i, sr, ghost, ta, ta, false, false, taken);
+                    FillR(g, new Rectangle(sx, sr.Y, sr.Right - sx, sr.Height), Fade(accent, (int)(70 * (1 - settle))));
+                    if (sp < 1f) FillR(g, new Rectangle(sx, sr.Y, D(2), sr.Height), accent);
+                }
+                else if (kind == VDelete && ghost != null)
+                {   // lost signal: dim / normal / dim / normal with a small sideways jitter, then gone
+                    bool dim = Math.Min(3, (int)(p * 4)) % 2 == 0;
+                    var rnd = new Random(frame * 7919 + i);
+                    var jr = sr;
+                    jr.Offset((int)Math.Round((rnd.NextDouble() * 2 - 1) * 2f * S), 0);
+                    int a = dim ? 60 : 255;
+                    FillR(g, jr, Fade(cField, a));
+                    LineR(g, jr, Fade(cLine, a), 1f);
+                    PaintVaultRow(g, i, jr, ghost, a, a, true, false, taken);
+                }
+                else PaintVaultEmpty(g, sr, 255);
+            }
+            g.Restore(clip);
+
+            if (n < MaxVault)
+            {
+                PaintField(g, fieldVault, txtVault.Focused);
+                var add = R(LW - Pad - 14 - 64, VaultY + VAddY, 64, 30);
+                Hit("vadd", add);
+                PaintSolidBtn(g, add, "ADD", Hov("vadd"));
+            }
+            else Micro(g, "VAULT FULL // MOVE OR DELETE ONE", c.X + D(14), D(VaultY + VAddY + 10), cMuted, false);
+        }
+
+        void PaintVaultEmpty(Graphics g, Rectangle sr, int alpha)
+        {
+            using (var pen = new Pen(Fade(cLine, alpha), 1f) { DashStyle = DashStyle.Dash })
+                g.DrawRectangle(pen, sr.X, sr.Y, sr.Width - 1, sr.Height - 1);
+            Micro(g, "EMPTY SLOT", sr.X + D(8), sr.Y + D(6), Fade(cMuted, alpha), false);
+        }
+
+        // contents of a filled vault row: text, age, -> NEXT button and delete x.
+        // alpha fades it (animations); buttons = draw them; live = they're also clickable.
+        void PaintVaultRow(Graphics g, int i, Rectangle sr, Idea idea, int alpha, int ageAlpha, bool buttons, bool live, bool taken)
+        {
+            Color red = Hex("#FF3B30");
+            bool sure = live && vConfirm == i;
+            string mv = taken ? "NEXT TAKEN" : "-> NEXT";
+            int delW = sure ? (int)MicroW(g, "SURE?", true) + D(10) : D(22);
+            var del = new Rectangle(sr.Right - delW, sr.Y, delW, sr.Height);
+            int mvW = (int)MicroW(g, mv, true) + D(12);
+            var btn = new Rectangle(del.X - D(2) - mvW, sr.Y + D(3), mvW, sr.Height - D(6));
+
+            // age nags harder the longer the idea sits: muted, accent from 14 days, red from 30
+            int age = VaultAge(idea);
+            string ages = age + "D";
+            float ax = btn.X - D(8) - MicroW(g, ages, false);
+            if (ageAlpha > 0) Micro(g, ages, ax, sr.Y + D(6), Fade(age >= 30 ? red : age >= 14 ? AccentText : cMuted, ageAlpha), false);
+
+            var tr = new Rectangle(sr.X + D(8), sr.Y, (int)ax - D(8) - sr.X - D(8), sr.Height);
+            if (alpha > 0)
+                using (var b = new SolidBrush(Fade(cInk, alpha)))
+                using (var sf = new StringFormat(StringFormatFlags.NoWrap) { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter })
+                    g.DrawString(idea.Text, fBody, b, tr, sf);
+            if (!buttons || alpha <= 0) return;
+
+            string km = "vmove" + i, kd = "vdel" + i;
+            if (live) { Hit(km, btn); Hit(kd, del); }
+            bool hm = live && !taken && Hov(km);   // locked: no accent hover
+            if (hm) FillR(g, btn, accent); else LineR(g, btn, Fade(taken ? cDim : cInk, alpha), 1.2f * S);
+            Micro(g, mv, btn.X + D(6), btn.Y + D(3), hm ? OnColor(accent) : Fade(taken ? cMuted : cInk, alpha), true);
+
+            if (sure) Micro(g, "SURE?", del.X + D(5), sr.Y + D(6), red, true);
+            else
+            {
+                float cx = del.X + del.Width / 2f, cy = del.Y + del.Height / 2f, u = 3.5f * S;
+                using (var pen = new Pen(Fade(live && Hov(kd) ? red : cMuted, alpha), 1.6f * S)) { g.DrawLine(pen, cx - u, cy - u, cx + u, cy + u); g.DrawLine(pen, cx - u, cy + u, cx + u, cy - u); }
+            }
         }
 
         void PaintRoutinePanel(Graphics g, List<Routine> due, Day t)
@@ -2210,6 +2525,7 @@ namespace OneCheck
         {
             // these play their own sound (save / undo / click depending on the result)
             if (h != "punch" && h != "undo" && h != "setToday" && h != "saveTomorrow" && h != "addRoutine"
+                && h != "vadd" && !h.StartsWith("vmove") && !h.StartsWith("vdel")
                 && !h.StartsWith("step") && !h.StartsWith("del") && !h.StartsWith("rtn") && !h.StartsWith("rdel")) Sound(Sfx.Click);
             switch (h)
             {
@@ -2225,6 +2541,7 @@ namespace OneCheck
                 case "punch": Punch(); break;
                 case "undo": Unpunch(); break;
                 case "saveTomorrow": SaveTomorrow(); break;
+                case "vadd": AddVault(); break;
                 case "themeDark": dark = true; ApplyTheme(); SaveSettings(); Invalidate(); break;
                 case "themeLight": dark = false; ApplyTheme(); SaveSettings(); Invalidate(); break;
                 case "togSound": sound = !sound; if (sound) Sfx.Play(customPunch ?? Sfx.Punch, true); SaveSettings(); Invalidate(); break;
@@ -2246,6 +2563,8 @@ namespace OneCheck
                     int si;
                     if (h.StartsWith("rtn") && int.TryParse(h.Substring(3), out si)) { ToggleRoutine(si); break; }
                     if (h.StartsWith("rdel") && int.TryParse(h.Substring(4), out si)) { DeleteRoutine(si); break; }
+                    if (h.StartsWith("vmove") && int.TryParse(h.Substring(5), out si)) { MoveVault(si); break; }
+                    if (h.StartsWith("vdel") && int.TryParse(h.Substring(4), out si)) { DeleteVault(si); break; }
                     if (h.StartsWith("rday"))
                     {   // rday{routine}_{weekday}
                         var p = h.Substring(4).Split('_');
