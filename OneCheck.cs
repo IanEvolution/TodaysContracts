@@ -358,13 +358,18 @@ namespace OneCheck
         int stepAnimIndex = -1;     // step being stamped, -1 = none
         DateTime stepAnimStart, unlockStart;   // unlockStart can be in the future: it waits for the step stamp
         bool unlockOn;
+        // "QUEUED" glitch on the NEXT field when tomorrow's task is saved: a shorter, lighter punch glitch
+        const float NextAnimMs = 340f;       // total length (the punch runs 520)
+        const float NextAnimSplit = 0.55f;   // share of it spent glitching in; the rest settles back to the field
+        const float NextAnimJitter = 10f;    // max slice jitter (the punch uses 18)
+        bool nextAnimOn;
+        DateTime nextAnimStart;
         // vault animations, one per slot: kind + start time; progress is worked out from the clock while painting
         const int VNone = 0, VStore = 1, VMove = 2, VDelete = 3;
-        const float VStoreMs = 250f, VMoveMs = 350f, VDeleteMs = 200f, NextPulseMs = 300f;
+        const float VStoreMs = 250f, VMoveMs = 350f, VDeleteMs = 200f;
         readonly int[] vAnimKind = new int[MaxVault];
         readonly DateTime[] vAnimStart = new DateTime[MaxVault];
         readonly Idea[] vGhost = new Idea[MaxVault];   // the idea that just left the slot (move / delete)
-        bool nextPulseOn; DateTime nextPulseStart;     // NEXT field border pulse when an idea lands there
         int vConfirm = -1;                             // slot whose delete is waiting for a second click
 
         public MainForm()
@@ -448,7 +453,8 @@ namespace OneCheck
             txtRoutine.HandleCreated += (s, e) => Cue(txtRoutine, "+ New routine, press Enter");
             txtVault.HandleCreated += (s, e) => Cue(txtVault, "Store an idea in the vault");
 
-            // animation timer only runs during the boot wipe, the punch glitch, a step stamp, the punch unlock and vault animations
+            // animation timer only runs during the boot wipe, the punch glitch, a step stamp, the punch unlock,
+            // the NEXT "QUEUED" glitch and vault animations
             animTimer = new System.Windows.Forms.Timer { Interval = 16 };
             animTimer.Tick += (s, e) =>
             {
@@ -458,10 +464,11 @@ namespace OneCheck
                 punchAnim = Math.Min(1f, (float)(DateTime.Now - punchStart).TotalMilliseconds / 520f);
                 if (StepAnim >= 1f) stepAnimIndex = -1;
                 if (UnlockAnim >= 1f) unlockOn = false;
+                if (nextAnimOn && NextAnim >= 1f) { nextAnimOn = false; Relayout(); }   // brings the NEXT text box back
                 bool busy = bootAnim < 1f || punchAnim < 1f;
                 if (was && !busy) Relayout();
                 bool vaultBusy = VaultAnimTick();
-                if (!busy && stepAnimIndex < 0 && !unlockOn && !vaultBusy) animTimer.Stop();
+                if (!busy && stepAnimIndex < 0 && !unlockOn && !nextAnimOn && !vaultBusy) animTimer.Stop();
                 Invalidate();
             };
             // checks once a minute whether the date rolled over; nothing else runs while idle
@@ -958,12 +965,15 @@ namespace OneCheck
         {
             string k = Key(DateTime.Today.AddDays(1));
             string v = txtTomorrow.Text.Trim();
-            var d = Get(k); d.Task = v; days[k] = d;
+            var d = Get(k);
+            string old = d.Task;
+            d.Task = v; days[k] = d;
             SaveDays();
             flash = v == "" ? "CLEARED" : "QUEUED";
             flashTimer.Stop(); flashTimer.Start();
             ActiveControl = null;
             Sound(Sfx.Save);
+            if (v != "" && v != old) StartNextAnim();   // not for clearing or re-saving the same text
             Invalidate();
         }
 
@@ -1007,6 +1017,18 @@ namespace OneCheck
         float StepAnim
         {
             get { return stepAnimIndex < 0 ? 1f : Math.Min(1f, (float)(DateTime.Now - stepAnimStart).TotalMilliseconds / StepAnimMs); }
+        }
+        float NextAnim
+        {
+            get { return !nextAnimOn ? 1f : Math.Min(1f, (float)(DateTime.Now - nextAnimStart).TotalMilliseconds / NextAnimMs); }
+        }
+        // the NEXT text box sits on top of the field, so it's hidden (in Relayout) while the glitch plays
+        void StartNextAnim()
+        {
+            nextAnimOn = true; nextAnimStart = DateTime.Now;
+            if (txtTomorrow.Focused) ActiveControl = null;
+            Relayout();
+            animTimer.Start();
         }
         float UnlockAnim
         {
@@ -1168,11 +1190,6 @@ namespace OneCheck
             return p < 1f ? kind : VNone;
         }
 
-        float NextPulse
-        {
-            get { return !nextPulseOn ? 1f : Math.Min(1f, (float)(DateTime.Now - nextPulseStart).TotalMilliseconds / NextPulseMs); }
-        }
-
         // drops finished vault animations; true while any is still running
         bool VaultAnimTick()
         {
@@ -1184,7 +1201,6 @@ namespace OneCheck
                 if (VaultAnim(i, out p) == VNone) { vAnimKind[i] = VNone; vGhost[i] = null; }
                 else any = true;
             }
-            if (NextPulse >= 1f) nextPulseOn = false; else any = true;
             return any;
         }
 
@@ -1222,7 +1238,7 @@ namespace OneCheck
             flash = "QUEUED";
             flashTimer.Stop(); flashTimer.Start();
             Sound(Sfx.Save);
-            nextPulseOn = true; nextPulseStart = DateTime.Now;
+            StartNextAnim();
             StartVaultAnim(i, VMove, idea);
             Relayout();
         }
@@ -1381,7 +1397,7 @@ namespace OneCheck
             int h = D(Math.Max(need, LH));
             if (ClientSize.Height != h) ClientSize = new Size(ClientSize.Width, h);
             PlaceBox(txtToday, fieldToday, todayBox);
-            PlaceBox(txtTomorrow, fieldTomorrow, !showSettings && !booting);
+            PlaceBox(txtTomorrow, fieldTomorrow, !showSettings && !booting && !nextAnimOn);
             PlaceBox(txtStep, fieldStep, !showSettings && !booting && AddVisible);
             PlaceBox(txtRoutine, fieldRoutine, showSettings && showRoutines && !booting && routines.Count < MaxRoutines);
             PlaceBox(txtVault, fieldVault, !showSettings && !booting && VaultCount() < MaxVault);
@@ -1712,10 +1728,8 @@ namespace OneCheck
                 FillR(g, fr, accent);
                 Micro(g, flash, fr.X + D(4), fr.Y + D(2), OnColor(accent), true);
             }
-            PaintField(g, fieldTomorrow, txtTomorrow.Focused);
-            float np = NextPulse;
-            if (np < 1f)   // a vault idea just landed here: the border flashes accent and eases back
-                LineR(g, fieldTomorrow, Fade(accent, (int)(255 * (1 - np) * (1 - np))), 2f * S);
+            if (nextAnimOn) PaintNextAnim(g);
+            else PaintField(g, fieldTomorrow, txtTomorrow.Focused);
             var sv = R(LW - Pad - 16 - 80, NextY + 42, 80, 42);
             Hit("saveTomorrow", sv);
             bool hasTomorrow = Get(Key(DateTime.Today.AddDays(1))).Task != "";
@@ -2149,17 +2163,8 @@ namespace OneCheck
                 var rnd = new Random(frame * 7919);
                 float grow = Math.Min(1f, a * 2.2f);
                 grow = 1 - (float)Math.Pow(1 - grow, 3);
-                int w = (int)(box.Width * grow);
-                int slices = 6, sh = box.Height / slices;
                 float amp = (1 - a) * 18 * S;
-                for (int i = 0; i < slices; i++)
-                {
-                    int off = (int)((rnd.NextDouble() * 2 - 1) * amp);
-                    var sr = new Rectangle(box.X + off, box.Y + i * sh, w, (i == slices - 1) ? box.Height - i * sh : sh);
-                    FillR(g, new Rectangle(sr.X - D(3), sr.Y, sr.Width, sr.Height), Color.FromArgb(160, Hex("#FF2E88")));
-                    FillR(g, new Rectangle(sr.X + D(3), sr.Y, sr.Width, sr.Height), Color.FromArgb(160, Hex("#19E3FF")));
-                    FillR(g, sr, accent);
-                }
+                PaintGlitchSlab(g, box, grow, amp, rnd, accent);
                 if (a > 0.35f) DrawCompleteText(g, box, time, OnColor(accent), (int)((rnd.NextDouble() * 2 - 1) * amp * 0.5f));
                 using (var pen = new Pen(accent, 2f * S)) g.DrawRectangle(pen, PanToday);
             }
@@ -2180,6 +2185,65 @@ namespace OneCheck
             float uw = MicroW(g, "UNDO", false);
             Micro(g, "UNDO", undo.Right - uw, y, Hov("undo") ? cInk : cMuted, false);
             if (Hov("undo")) using (var p = new Pen(cInk, 1)) g.DrawLine(p, undo.Right - uw, y + D(12), undo.Right, y + D(12));
+        }
+
+        // the glitch slab shared by the punch and the NEXT "QUEUED" animation: the box grown to `grow` of its width,
+        // cut into slices that each jitter sideways by up to `amp` pixels, with a pink/cyan RGB split behind the fill
+        void PaintGlitchSlab(Graphics g, Rectangle box, float grow, float amp, Random rnd, Color fill)
+        {
+            int w = (int)(box.Width * grow);
+            int slices = 6, sh = box.Height / slices;
+            for (int i = 0; i < slices; i++)
+            {
+                int off = (int)((rnd.NextDouble() * 2 - 1) * amp);
+                var sr = new Rectangle(box.X + off, box.Y + i * sh, w, (i == slices - 1) ? box.Height - i * sh : sh);
+                FillR(g, new Rectangle(sr.X - D(3), sr.Y, sr.Width, sr.Height), Color.FromArgb(160, Hex("#FF2E88")));
+                FillR(g, new Rectangle(sr.X + D(3), sr.Y, sr.Width, sr.Height), Color.FromArgb(160, Hex("#19E3FF")));
+                FillR(g, sr, fill);
+            }
+        }
+
+        // NEXT field while tomorrow's task is being stamped in (the text box is hidden meanwhile)
+        void PaintNextAnim(Graphics g)
+        {
+            var f = fieldTomorrow;
+            float p = NextAnim;
+            Color ink = OnColor(accent);
+            var st = g.Save();
+            g.SetClip(f, CombineMode.Intersect);   // nothing spills onto the QUEUE button or the panel
+            if (p < NextAnimSplit)
+            {   // glitch in: same moves as PaintComplete, with less jitter
+                float a = p / NextAnimSplit;
+                var rnd = new Random(frame * 7919);
+                float grow = Math.Min(1f, a * 2.2f);
+                grow = 1 - (float)Math.Pow(1 - grow, 3);
+                float amp = (1 - a) * NextAnimJitter * S;
+                FillR(g, f, cField);
+                PaintGlitchSlab(g, f, grow, amp, rnd, accent);
+                if (a > 0.35f)
+                    WideCenterV(g, "QUEUED", fBtn, ink, f.X + D(14) + (int)((rnd.NextDouble() * 2 - 1) * amp * 0.5f), f, WIDE + 0.1f);
+            }
+            else
+            {   // settle: the normal field with the saved task, the slab pulling away to the left over it
+                float b = (p - NextAnimSplit) / (1f - NextAnimSplit);
+                PaintField(g, f, false);
+                // drawn where the text box will reappear, so the text doesn't jump
+                using (var br = new SolidBrush(cInk))
+                using (var sf = new StringFormat(StringFormatFlags.NoWrap) { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.None })
+                    g.DrawString(Get(Key(DateTime.Today.AddDays(1))).Task, fBody, br, txtTomorrow.Bounds, sf);
+                float e = 1 - (float)Math.Pow(1 - b, 3);
+                var slab = new Rectangle(f.X, f.Y, (int)(f.Width * (1 - e)), f.Height);
+                if (slab.Width > 0)
+                {
+                    var ss = g.Save();
+                    g.SetClip(slab, CombineMode.Intersect);
+                    FillR(g, slab, accent);
+                    WideCenterV(g, "QUEUED", fBtn, ink, f.X + D(14), f, WIDE + 0.1f);
+                    g.Restore(ss);
+                }
+                LineR(g, f, Fade(accent, (int)(255 * (1 - b))), 2f * S);
+            }
+            g.Restore(st);
         }
 
         void DrawCompleteText(Graphics g, Rectangle box, string time, Color ink, int jitter)
